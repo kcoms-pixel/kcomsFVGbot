@@ -1,475 +1,1135 @@
-# KCOMS V9.6 - FULL - FVG + REVERSAL + IFVG + TRAILING + 2ND POSITION
-# Paper Only. All videos: FVG + Golden + Homma + Killzone + Protected Low + Valid CHoCH + IFVG + Trailing + Pyramid
-# HTF: 1h Supply/Demand + Protected | LTF: 5m CHoCH + Sweep + FVG/IFVG | 1-7 entries/day, max 2 open, 2nd at half risk
-import threading, time, requests, os, json, math
-from flask import Flask, jsonify
-from datetime import datetime, timezone, timedelta
+"""FVG 1.0 - quality-filtered multi-timeframe BTCUSDT signal engine with V6.7-compatible Binance price fallback.
 
+Paper-trading by default. Live execution is intentionally not implemented in this
+release; do not enable real orders until a separately tested Binance USD-M Futures
+execution/risk module has been added.
+
+Dependencies: pip install -r requirements.txt
+Environment:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional)
+  SYMBOL=BTCUSDT
+  MIN_SCORE=60
+  TRADE_SIZE_USDT=5 (legacy alias for MAX_NOTIONAL_USDT)
+  MAX_NOTIONAL_USDT=5
+  MIN_NET_RR_AFTER_FEES=1.0
+  PAPER_BALANCE=100
+  PAPER_BALANCE_FILE=/tmp/fvg1_paper_balance.json
+  SCAN_INTERVAL=1
+  COOLDOWN_MINUTES=2
+  PRICE_STALE_SECONDS=5
+  TRADE_ENABLED=false (true is rejected intentionally in this build)
+"""
+
+import json
+import logging
+import math
+import os
+import threading
+import time
+import queue
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from flask import Flask, jsonify
+
+# ----------------------------- Configuration -----------------------------
 app = Flask(__name__)
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
+MIN_SCORE = int(os.getenv("MIN_SCORE", "60"))
+SCAN_INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL", "1")))
+LOG_INTERVAL_SECONDS = max(0.5, float(os.getenv("LOG_INTERVAL_SECONDS", "0.5")))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "15"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "2"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))  # percent of paper equity
+RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
+# Honour the older Render variable if MAX_NOTIONAL_USDT is not explicitly set.
+# This prevents TRADE_SIZE_USDT=5 from being silently ignored.
+MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", os.getenv("TRADE_SIZE_USDT", "5")))
+FVG_MAX_AGE_CANDLES = int(os.getenv("FVG_MAX_AGE_CANDLES", "80"))
+FVG_MIN_DISPLACEMENT_ATR = float(os.getenv("FVG_MIN_DISPLACEMENT_ATR", "0.8"))
+FVG_STOP_ATR_BUFFER = float(os.getenv("FVG_STOP_ATR_BUFFER", "0.25"))
+FVG_ENTRY_TOLERANCE_ATR = float(os.getenv("FVG_ENTRY_TOLERANCE_ATR", "0.15"))
+PAPER_BALANCE_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/fvg1_paper_balance.json")
+PAPER_START_BALANCE = float(os.getenv("PAPER_BALANCE", "100"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TRADE_ENABLED = os.getenv("TRADE_ENABLED", "false").lower() == "true"
+PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.001"))  # estimated fee per side
+MIN_NET_RR_AFTER_FEES = float(os.getenv("MIN_NET_RR_AFTER_FEES", "1.0"))
+PRICE_STALE_SECONDS = max(2, int(os.getenv("PRICE_STALE_SECONDS", "5")))
+REST_CONNECT_TIMEOUT = max(0.5, float(os.getenv("REST_CONNECT_TIMEOUT", "1.5")))
+REST_READ_TIMEOUT = max(1.0, float(os.getenv("REST_READ_TIMEOUT", "2.5")))
+# Signal freshness windows: lower-timeframe confirmation may arrive after structure forms.
+CHOCH_VALID_30S_CANDLES = max(1, int(os.getenv("CHOCH_VALID_30S_CANDLES", "5")))
+STRUCTURE_VALID_5M_CANDLES = max(1, int(os.getenv("STRUCTURE_VALID_5M_CANDLES", "2")))
 
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "7"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "5"))
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.1"))
-ADDON_RISK_PERCENT = float(os.getenv("ADDON_RISK_PERCENT", "0.05"))
-MAX_NOTIONAL = float(os.getenv("MAX_NOTIONAL_USDT", os.getenv("TRADE_SIZE_USDT", "5")))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USDT", "3.0"))
-MAX_CONSEC_LOSS = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-PAPER_FILE = os.getenv("PAPER_BALANCE_FILE", "/tmp/kcoms_v9_balance.json")
-START_BAL = float(os.getenv("PAPER_BALANCE", "100"))
-SCAN_INTERVAL = 1
-FEE = 0.001
+if TRADE_ENABLED:
+    raise RuntimeError(
+        "KCOMS V7 release is paper-only. Live trading is blocked until a tested "
+        "Binance USD-M Futures execution module is installed. Set TRADE_ENABLED=false."
+    )
+if not (1 <= MIN_SCORE <= 100):
+    raise ValueError("MIN_SCORE must be between 1 and 100")
+if not (0 < RISK_PERCENT <= 2):
+    raise ValueError("RISK_PERCENT must be >0 and <=2")
+if MAX_NOTIONAL_USDT <= 0:
+    raise ValueError("MAX_NOTIONAL_USDT / TRADE_SIZE_USDT must be positive")
+if not (0 <= PAPER_FEE_RATE < 0.02):
+    raise ValueError("PAPER_FEE_RATE must be between 0 and 0.02")
+if MIN_NET_RR_AFTER_FEES < 0:
+    raise ValueError("MIN_NET_RR_AFTER_FEES cannot be negative")
 
-EAT = timezone(timedelta(hours=3), "EAT")
-def now_eat(): return datetime.now(EAT)
+# Binance Spot public market-data only. No Futures endpoints are used for V7 paper analysis.
+# data-api.binance.vision is the public market-data host; official Spot API hosts are fallbacks.
+SPOT_REST_ENDPOINTS = [
+    # V6.7 successfully used this public market-data host for /api/v3/klines.
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api-gcp.binance.com",
+]
+PRICE_WS_URLS = [
+    f"wss://data-stream.binance.vision/ws/{SYMBOL.lower()}@trade",
+    f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@trade",
+]
+EAT = timezone(timedelta(hours=3), "EAT")  # East Africa Time (UTC+3)
 
-state = {"balance": START_BAL, "wins":0, "losses":0, "trades_today":0, "day": now_eat().date().isoformat(),
-         "day_start": START_BAL, "consec_loss":0, "cooldown_until":0, "positions":[], "trade_history":[],
-         "tier_a_count":0, "tier_b_count":0}
-latest = {"bot":"KCOMS V9.6", "status":"BOOTING", "price":0, "bias":"NEUTRAL", "fvg":None, "ce":None, "tier":"NONE",
-          "killzone":"NONE", "golden":False, "homma":"NONE", "protected":None, "choch_valid":False, "ifvg":None, "in_zone":False, "open_pos":0,
-          "balance":START_BAL, "wins":0, "losses":0, "trades_today":0, "last":"Booting V9.6", "rejection":""}
+def current_clock() -> dict:
+    now = datetime.now(EAT)
+    return {"date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
+            "timezone": "EAT", "timestamp": now.isoformat()}
+
+price_lock = threading.RLock()
+price_feed = {
+    "price": None, "received_at": 0.0, "source": "WAITING_FOR_BINANCE_SPOT",
+    "exchange_event_ms": None, "exchange_trade_ms": None,
+    "latency_ms": None, "ws_connected": False, "last_ws_message_at": 0.0,
+}
+telegram_queue = queue.Queue(maxsize=500)
+telegram_worker_started = False
+rest_endpoint_retry_after = {}
+ws_thread = None
+ws_stop = threading.Event()
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent":"Mozilla/5.0"})
-BASES = ["https://data-api.binance.vision","https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com"]
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; FVG-1.0/1.0)"})
 
-def send_tg(msg):
-    try:
-        if TG_TOKEN and TG_CHAT:
-            SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id":TG_CHAT,"text":msg}, timeout=5)
-    except: pass
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("FVG-1.0")
 
-def get_klines(tf, limit=250):
-    for base in BASES:
+# ----------------------------- Runtime state -----------------------------
+lock = threading.RLock()
+latest = {
+    "bot": "FVG 1.0", "status": "BOOTING", "symbol": SYMBOL,
+    **current_clock(),
+    "price": 0.0, "ema": 0.0, "price_source": "NOT_CONNECTED", "price_timestamp": None,
+    "price_age_seconds": None, "price_latency_ms": None, "price_feed_status": "CONNECTING",
+    "bias": "NEUTRAL", "signal": "NONE", "score": 0,
+    "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
+    "balance": PAPER_START_BALANCE, "last_signal": "Starting",
+    "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [],
+    "side_diagnostics": {}, "long_score": 0, "short_score": 0,
+    "entry_trigger": "NONE", "fvg_zones": {}, "fvg_diagnostics": {}, "last_error": "",
+}
+state = {
+    "balance": PAPER_START_BALANCE,
+    "wins": 0,
+    "losses": 0,
+    "trades_today": 0,
+    "day": datetime.now(EAT).date().isoformat(),
+    "cooldown_until": 0.0,
+    "position": None,
+    "last_processed_1m": None,
+    "last_alert_key": None,
+    "last_trade_key": None,
+    "last_status_log": 0.0,
+    "last_diagnostic_key": None,
+    "rejection_counts": {},
+    "recent_rejections": [],
+    "trade_history": [],
+}
+
+# Cached candles avoid requesting five full histories every second.
+candle_cache: Dict[str, Dict[str, object]] = {}
+CACHE_TTL = {"1m": 2, "5m": 15, "15m": 30, "30m": 45, "1h": 60}
+
+# ----------------------------- Notifications -----------------------------
+def _telegram_sender_worker() -> None:
+    """Deliver queued Telegram text alerts off the market-scanning thread."""
+    while True:
+        message = telegram_queue.get()
         try:
-            r = SESSION.get(f"{base}/api/v3/klines", params={"symbol":SYMBOL,"interval":tf,"limit":limit}, timeout=(2,4))
-            d = r.json()
-            if isinstance(d, list) and len(d)>30:
-                return [{"t":int(k[0]),"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"v":float(k[5]),"ct":int(k[6])} for k in d]
-        except: pass
-    return None
+            if TG_TOKEN and TG_CHAT:
+                response = SESSION.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": message},
+                    timeout=(2, 4),
+                )
+                response.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("Telegram delivery failed: %s", exc)
+        finally:
+            telegram_queue.task_done()
 
-def closed(rows):
-    now_ms = int(time.time()*1000)
-    return [c for c in rows if c["ct"] < now_ms]
 
-def ema(vals, p):
-    if len(vals)<p: return None
-    k=2/(p+1); e=sum(vals[:p])/p
-    for v in vals[p:]: e=v*k+e*(1-k)
-    return e
+def start_telegram_worker_once() -> None:
+    global telegram_worker_started
+    if telegram_worker_started:
+        return
+    telegram_worker_started = True
+    threading.Thread(target=_telegram_sender_worker, daemon=True, name="telegram-outbox").start()
 
-def atr(rows, p=14):
-    if len(rows)<p+1: return None
-    tr=[max(rows[i]["h"]-rows[i]["l"], abs(rows[i]["h"]-rows[i-1]["c"]), abs(rows[i]["l"]-rows[i-1]["c"])) for i in range(1,len(rows))]
-    return sum(tr[-p:])/p
 
-def get_killzone():
-    h = now_eat().hour + now_eat().minute/60.0
-    if 9.0 <= h < 11.0: return ("LONDON_SILVER_BULLET", 20)
-    if 17.0 <= h < 19.0: return ("NY_SILVER_BULLET", 20)
-    if 10.0 <= h < 12.0: return ("LONDON_OPEN", 15)
-    if 15.5 <= h < 17.0: return ("NY_OPEN", 15)
-    if 20.0 <= h < 22.0: return ("NY_PM", 5)
-    if 22.0 <= h or h < 8.0: return ("DEAD_ZONE", -10)
-    return ("NORMAL", 0)
+def send_tg(message: str) -> None:
+    """Queue Telegram alerts so network delays never block price scanning."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    start_telegram_worker_once()
+    try:
+        telegram_queue.put_nowait(message)
+    except queue.Full:
+        log.error("Telegram outbox full; dropping oldest pending message")
+        try:
+            telegram_queue.get_nowait()
+            telegram_queue.task_done()
+            telegram_queue.put_nowait(message)
+        except queue.Empty:
+            pass
 
-def find_fvgs(rows):
-    fvgs=[]
-    for i in range(1, len(rows)-1):
-        c1, c2, c3 = rows[i-1], rows[i], rows[i+1]
-        if c1["h"] < c3["l"]:
-            top, bot = c3["l"], c1["h"]
-            fvgs.append({"dir":"LONG","top":top,"bot":bot,"ce":(top+bot)/2,"size":top-bot,"idx":i,"time":c2["t"]})
-        if c1["l"] > c3["h"]:
-            top, bot = c1["l"], c3["h"]
-            fvgs.append({"dir":"SHORT","top":top,"bot":bot,"ce":(top+bot)/2,"size":top-bot,"idx":i,"time":c2["t"]})
-    return fvgs
 
-def get_protected_level(rows, bias):
-    if len(rows)<30: return None
-    if bias=="BULLISH":
-        return min(c["l"] for c in rows[-25:-5])
-    elif bias=="BEARISH":
-        return max(c["h"] for c in rows[-25:-5])
-    return None
+# ----------------------------- Market data -----------------------------
+def _record_price(value: float, source: str) -> None:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Invalid Binance Spot price")
+    received = time.time()
+    with price_lock:
+        price_feed.update({"price": value, "received_at": received, "source": source})
+        if source != "BINANCE_SPOT_WS":
+            # A REST snapshot has no exchange event timestamp; don't reuse old WS latency.
+            price_feed["exchange_event_ms"] = None
+            price_feed["exchange_trade_ms"] = None
+            price_feed["latency_ms"] = None
+        age_ms = None
+        if price_feed.get("exchange_event_ms") is not None:
+            age_ms = max(0.0, received * 1000.0 - float(price_feed["exchange_event_ms"]))
+        price_feed["latency_ms"] = round(age_ms, 1) if age_ms is not None else None
+    latest["price_source"] = source
+    latest["price_timestamp"] = datetime.now(timezone.utc).isoformat()
+    latest["price_age_seconds"] = 0.0
+    latest["price_latency_ms"] = price_feed.get("latency_ms")
+    latest["last_error"] = ""
 
-def get_htf_zone(rows1h, bias):
-    fvgs = find_fvgs(rows1h)
-    if not fvgs: return None, False
-    if bias=="BULLISH":
-        cands = [f for f in fvgs if f["dir"]=="LONG"]
-    else:
-        cands = [f for f in fvgs if f["dir"]=="SHORT"]
-    if not cands: return None, False
-    z = cands[-1]
-    return z, True
 
-def is_valid_choch(rows5, protected, direction, atr5):
-    if protected is None: return False, "NO_PROTECTED"
-    last3 = rows5[-3:]
-    last = rows5[-1]
-    if direction=="SHORT":
-        continued = min(c["l"] for c in last3) < protected - 0.5*atr5
-        if not continued: return False, "INVALID: Failure to Continue"
-        prior_high = max(c["h"] for c in rows5[-10:-3])
-        if max(c["c"] for c in last3) > prior_high: return False, "INVALID: Broke back above High"
-        if last["l"] < protected and last["c"] > protected: return False, "INVALID: Liquidity Grab wick only"
-    if direction=="LONG":
-        continued = max(c["h"] for c in last3) > protected + 0.5*atr5
-        if not continued: return False, "INVALID: Failure to Continue"
-        prior_low = min(c["l"] for c in rows5[-10:-3])
-        if min(c["c"] for c in last3) < prior_low: return False, "INVALID: Broke back below Low"
-        if last["h"] > protected and last["c"] < protected: return False, "INVALID: Liquidity Grab wick only"
-    return True, "VALID CHoCH"
-
-def find_ifvg(rows):
-    ifvgs=[]
-    fvgs = find_fvgs(rows)
-    for f in fvgs:
-        for c in rows[-5:]:
-            if f["dir"]=="SHORT" and c["c"] > f["top"]:
-                ifvgs.append({"dir":"LONG","top":f["top"],"bot":f["bot"],"ce":f["ce"],"type":"IFVG"})
-                break
-            if f["dir"]=="LONG" and c["c"] < f["bot"]:
-                ifvgs.append({"dir":"SHORT","top":f["top"],"bot":f["bot"],"ce":f["ce"],"type":"IFVG"})
-                break
-    return ifvgs
-
-def find_sweep_and_bos(rows5, direction):
-    seg = rows5[-30:]
-    if len(seg)<20: return False, False, None, None, None
-    if direction=="LONG":
-        lows = [c["l"] for c in seg[-15:-5]]
-        eq_low = min(lows)
-        sweep=False; sweep_low=None
-        for c in seg[-10:]:
-            if c["l"] < eq_low and c["c"] > eq_low:
-                sweep=True; sweep_low=c["l"]; break
-        last_high = max(c["h"] for c in seg[-20:-5])
-        bos = rows5[-1]["c"] > last_high
-        move_start = sweep_low if sweep_low else min(c["l"] for c in seg[-20:])
-        move_end = max(c["h"] for c in seg[-5:])
-        return sweep, bos, sweep_low, move_start, move_end
-    else:
-        highs = [c["h"] for c in seg[-15:-5]]
-        eq_high = max(highs)
-        sweep=False; sweep_high=None
-        for c in seg[-10:]:
-            if c["h"] > eq_high and c["c"] < eq_high:
-                sweep=True; sweep_high=c["h"]; break
-        last_low = min(c["l"] for c in seg[-20:-5])
-        bos = rows5[-1]["c"] < last_low
-        move_start = sweep_high if sweep_high else max(c["h"] for c in seg[-20:])
-        move_end = min(c["l"] for c in seg[-5:])
-        return sweep, bos, sweep_high, move_start, move_end
-
-def is_golden_fvg(fvg, move_start, move_end, direction):
-    rng = abs(move_end - move_start)
-    if rng == 0: return False, False
-    if direction=="LONG":
-        fib50 = move_end - 0.50*rng; fib618 = move_end - 0.618*rng
-        fib382 = move_end - 0.382*rng; fib786 = move_end - 0.786*rng
-        golden = not (fvg["top"] < fib618 or fvg["bot"] > fib50)
-        standard = not (fvg["top"] < fib786 or fvg["bot"] > fib382)
-        return golden, standard
-    else:
-        fib50 = move_end + 0.50*rng; fib618 = move_end + 0.618*rng
-        fib382 = move_end + 0.382*rng; fib786 = move_end + 0.786*rng
-        golden = not (fvg["bot"] > fib618 or fvg["top"] < fib50)
-        standard = not (fvg["bot"] > fib786 or fvg["top"] < fib382)
-        return golden, standard
-
-def homma_confirmation(candles, direction):
-    if len(candles)<2: return False, "NONE"
-    c = candles[-1]; prev = candles[-2]
-    body = abs(c["c"] - c["o"]); rng = c["h"] - c["l"]
-    if rng==0: return False, "NONE"
-    if direction=="LONG":
-        lower_wick = min(c["o"], c["c"]) - c["l"]
-        if lower_wick > 2*body and c["c"] > c["o"]: return True, "BULLISH_PIN_BAR"
-        if c["c"] > prev["o"] and c["o"] < prev["c"] and c["c"] > c["o"]: return True, "BULLISH_ENGULFING"
-        if body < rng*0.2: return True, "DOJI"
-    else:
-        upper_wick = c["h"] - max(c["o"], c["c"])
-        if upper_wick > 2*body and c["c"] < c["o"]: return True, "BEARISH_PIN_BAR"
-        if c["c"] < prev["o"] and c["o"] > prev["c"] and c["c"] < c["o"]: return True, "BEARISH_ENGULFING"
-        if body < rng*0.2: return True, "DOJI"
-    return False, "NONE"
-
-def filter_fvgs(fvgs, rows1h, atr1h, direction):
-    cands = [f for f in fvgs if f["dir"]==direction]
-    if not cands: return None
-    cands = [f for f in cands if f["size"] >= 0.5*atr1h]
-    if not cands: return None
-    move_low = min(c["l"] for c in rows1h[-20:])
-    move_high = max(c["h"] for c in rows1h[-20:])
-    mid = (move_low+move_high)/2
-    if direction=="LONG":
-        cands = [f for f in cands if f["ce"] < mid]
-        cands.sort(key=lambda x: x["ce"])
-    else:
-        cands = [f for f in cands if f["ce"] > mid]
-        cands.sort(key=lambda x: -x["ce"])
-    if not cands: return None
-    best = cands[0]
-    for lvl in [move_high, move_low]:
-        if abs(best["ce"]-lvl) < 0.5*atr1h: return None
-    nearest_round = round(best["ce"]/1000)*1000
-    if abs(best["ce"]-nearest_round) < 0.3*atr1h: return None
-    return best
-
-def analyse():
-    d1h = get_klines("1h", 250); d15 = get_klines("15m", 250); d5 = get_klines("5m", 250); d1 = get_klines("1m", 250)
-    if not all([d1h,d15,d5,d1]): return None
-    c1h, c15, c5, c1 = closed(d1h), closed(d15), closed(d5), closed(d1)
-    if len(c1h)<50 or len(c5)<50: return None
-    price = d1[-1]["c"]
-    closes1h = [c["c"] for c in c1h]
-    e200 = ema(closes1h,200)
-    atr1h_val = atr(c1h) or 100
-    atr5 = atr(c5) or 50
-    bias = "NEUTRAL"
-    if e200 and price>e200: bias="BULLISH"
-    if e200 and price<e200: bias="BEARISH"
-    kz_name, kz_bonus = get_killzone()
-    fvgs1h = find_fvgs(c1h)
-    fvgs15 = find_fvgs(c15)
-    htf_zone, has_zone = get_htf_zone(c1h, bias)
-    protected = get_protected_level(c1h, bias)
-    ifvgs = find_ifvg(c5)
-    results={}
-    for direction in ["LONG","SHORT"]:
-        is_reversal = (bias=="BULLISH" and direction=="SHORT") or (bias=="BEARISH" and direction=="LONG")
-        sweep, bos, sweep_extreme, move_start, move_end = find_sweep_and_bos(c5, direction)
-        disp=False
-        if len(c5)>=3:
-            last3=c5[-3:]
-            avg_range=sum(c["h"]-c["l"] for c in c5[-20:-3])/17
-            disp=(abs(last3[-1]["c"]-last3[0]["o"]) > 1.5*avg_range)
-        fvg = filter_fvgs(fvgs1h, c1h, atr1h_val, direction)
-        if not fvg:
-            fvg = filter_fvgs(fvgs15, c15, atr(c15) or 50, direction)
-        ifvg = None
-        for iv in ifvgs:
-            if iv["dir"]==direction: ifvg=iv; break
-        golden=False; standard=False
-        if fvg and move_start is not None and move_end is not None:
-            golden, standard = is_golden_fvg(fvg, move_start, move_end, direction)
-        in_fvg=False; near_ce=False; invalid=False
-        if fvg:
-            in_fvg = fvg["bot"] <= price <= fvg["top"]
-            near_ce = abs(price - fvg["ce"]) <= 0.25*fvg["size"] + 0.2*atr5
-            for c in c5[-5:]:
-                if direction=="LONG" and c["c"] < fvg["bot"]: invalid=True
-                if direction=="SHORT" and c["c"] > fvg["top"]: invalid=True
-            if invalid: fvg=None; in_fvg=False; near_ce=False; golden=False; standard=False
-        homma_ok, homma_name = homma_confirmation(c5[-3:], direction)
-        choch=False
-        if len(c5)>=6:
-            micro=c5[-6:-1]
-            if direction=="LONG" and c5[-1]["c"] > max(x["h"] for x in micro): choch=True
-            if direction=="SHORT" and c5[-1]["c"] < min(x["l"] for x in micro): choch=True
-        old_bias = "BEARISH" if direction=="LONG" else "BULLISH"
-        prot_for_check = get_protected_level(c1h, old_bias)
-        valid_choch, choch_reason = is_valid_choch(c5, prot_for_check, direction, atr5)
-        if not choch:
-            valid_choch=False; choch_reason="NO CHoCH"
-        in_zone=False
-        if htf_zone:
-            if htf_zone["bot"] - 0.5*atr1h_val <= price <= htf_zone["top"] + 0.5*atr1h_val:
-                in_zone=True
-        if is_reversal and not in_zone:
-            results[direction]={"score":0,"reasons":["REVERSAL outside HTF Supply/Demand - No trade"],"confirmed":False,"fvg":None,"sl":0,"tp":0,"entry":price,"tier":None,"golden":False,"homma":False,"homma_name":"NONE","near_ce":False,"sweep":False,"bos":False,"protected":protected,"valid_choch":False,"ifvg":None,"in_zone":False}
+def _spot_get(path: str, params: dict) -> Optional[object]:
+    failures = []
+    now = time.time()
+    for base in SPOT_REST_ENDPOINTS:
+        if rest_endpoint_retry_after.get(base, 0.0) > now:
             continue
-        score=0; reasons=[f"KZ:{kz_name} {kz_bonus:+d}"]
-        if sweep: score+=25; reasons.append("Sweep")
-        if disp: score+=15; reasons.append("Displacement")
-        if bos: score+=20; reasons.append("BOS")
-        if fvg: score+=20; reasons.append(f"FVG {fvg['bot']:.1f}-{fvg['top']:.1f} CE {fvg['ce']:.1f}")
-        if golden: score+=25; reasons.append("GOLDEN 50-61.8%")
-        elif standard: score+=10; reasons.append("Standard 38.2-78.6%")
-        if ifvg: score+=25; reasons.append(f"IFVG {ifvg['bot']:.1f}-{ifvg['top']:.1f}")
-        if in_fvg: score+=10; reasons.append("Price in FVG")
-        if near_ce: score+=15; reasons.append("At CE 50%")
-        if choch: score+=10; reasons.append("5m CHoCH")
-        if valid_choch: score+=20; reasons.append(f"VALID CHoCH {choch_reason}")
-        else: reasons.append(f"{choch_reason}")
-        if homma_ok: score+=20; reasons.append(f"Homma {homma_name}")
-        if in_zone: score+=15; reasons.append("In HTF Supply/Demand")
-        if bias==("BULLISH" if direction=="LONG" else "BEARISH"): score+=5; reasons.append("HTF aligned")
-        score+=kz_bonus
-        tier=None
-        trades_today = state["trades_today"]
-        if trades_today >= 7:
-            tier=None
-        elif (golden or ifvg) and homma_ok and valid_choch and score>=95:
-            tier="A_GOLDEN"
-        elif trades_today < 3:
-            if score>=105 and homma_ok and valid_choch and kz_name in ("LONDON_SILVER_BULLET","NY_SILVER_BULLET"):
-                tier="A_GOLDEN"
-            else:
-                tier=None
-        elif trades_today >=3 and trades_today <7:
-            if (standard or ifvg) and score>=85 and valid_choch and (homma_ok or choch):
-                tier="B_STANDARD"
-        if ifvg:
-            entry = ifvg["bot"] if direction=="LONG" else ifvg["top"]
-        elif homma_ok:
-            entry = c5[-1]["c"]
-        elif fvg:
-            entry = fvg["ce"]
-        else:
-            entry = price
-        if direction=="LONG":
-            sl = (c5[-1]["l"] - 0.2*atr5) if homma_ok else ((sweep_extreme - 0.3*atr5) if sweep_extreme else (fvg["bot"]-0.5*atr5 if fvg else price-atr5))
-            if ifvg: sl = ifvg["bot"] - 0.3*atr5
-            tp = max(c["h"] for c in c1h[-20:])
-            if tp - entry < 2*abs(entry-sl):
-                tp = entry + 2*abs(entry-sl)
-        else:
-            sl = (c5[-1]["h"] + 0.2*atr5) if homma_ok else ((sweep_extreme + 0.3*atr5) if sweep_extreme else (fvg["top"]+0.5*atr5 if fvg else price+atr5))
-            if ifvg: sl = ifvg["top"] + 0.3*atr5
-            tp = min(c["l"] for c in c1h[-20:])
-            if entry - tp < 2*abs(entry-sl):
-                tp = entry - 2*abs(entry-sl)
-        confirmed = tier is not None and sweep and bos and disp and (fvg or ifvg) and valid_choch and (near_ce or ifvg) and (homma_ok or choch)
-        if not confirmed: tier=None
-        results[direction]={"score":score,"reasons":reasons,"confirmed":confirmed,"fvg":fvg,"sl":sl,"tp":tp,"entry":entry,"tier":tier,"golden":golden,"homma":homma_ok,"homma_name":homma_name,"near_ce":near_ce,"sweep":sweep,"bos":bos,"disp":disp,"choch":choch,"protected":protected,"valid_choch":valid_choch,"ifvg":ifvg,"in_zone":in_zone}
-    best_dir = max(results, key=lambda k: results[k]["score"])
-    return {"price":price,"bias":bias,"best":best_dir,"results":results,"ema":e200,"atr1h":atr1h_val,"kz":kz_name,"protected":protected,"htf_zone":htf_zone}
+        try:
+            response = SESSION.get(
+                base + path, params=params,
+                timeout=(REST_CONNECT_TIMEOUT, REST_READ_TIMEOUT),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+                raise ValueError(f"Binance API {payload.get('code')}: {payload.get('msg')}")
+            rest_endpoint_retry_after.pop(base, None)
+            return payload
+        except (requests.RequestException, ValueError) as exc:
+            failures.append(f"{base}: {exc}")
+            # Temporarily skip a failing host rather than paying its timeout on every scan.
+            rest_endpoint_retry_after[base] = time.time() + 30
+    latest["last_error"] = " | ".join(failures[-3:]) or "No Binance Spot REST endpoint responded"
+    return None
 
-def load():
+
+def _websocket_price_worker() -> None:
+    """Reconnect to Binance public Spot trade stream; REST remains the fallback."""
     try:
-        with open(PAPER_FILE) as f: s=json.load(f)
-        # Migrate old V9.5 single position to list
-        if "position" in s and s["position"]:
-            s["positions"]=[s["position"]]
-        if "positions" not in s: s["positions"]=[]
-        state.update(s)
-    except: pass
-def save():
+        import websocket
+    except ImportError:
+        log.warning("websocket-client is not installed; Binance Spot REST price polling will be used")
+        return
+    attempt = 0
+    while not ws_stop.is_set():
+        url = PRICE_WS_URLS[attempt % len(PRICE_WS_URLS)]
+        try:
+            def on_open(_ws):
+                with price_lock:
+                    price_feed["ws_connected"] = True
+                latest["price_feed_status"] = "WEBSOCKET_CONNECTED"
+                log.info("Binance Spot WebSocket connected: %s", url)
+
+            def on_message(_ws, message):
+                try:
+                    payload = json.loads(message)
+                    price = float(payload["p"])
+                    event_ms = payload.get("E")
+                    trade_ms = payload.get("T")
+                    with price_lock:
+                        price_feed["exchange_event_ms"] = int(event_ms) if event_ms else None
+                        price_feed["exchange_trade_ms"] = int(trade_ms) if trade_ms else None
+                        price_feed["last_ws_message_at"] = time.time()
+                    _record_price(price, "BINANCE_SPOT_WS")
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    log.warning("Ignored malformed Binance Spot WebSocket message")
+
+            def on_error(_ws, error):
+                latest["price_feed_status"] = "WEBSOCKET_ERROR"
+                log.warning("Binance Spot WebSocket error: %s", error)
+
+            def on_close(_ws, _code, _message):
+                with price_lock:
+                    price_feed["ws_connected"] = False
+                latest["price_feed_status"] = "WEBSOCKET_RECONNECTING"
+                log.warning("Binance Spot WebSocket disconnected")
+
+            app_ws = websocket.WebSocketApp(
+                url, on_open=on_open, on_message=on_message,
+                on_error=on_error, on_close=on_close,
+            )
+            app_ws.run_forever(ping_interval=15, ping_timeout=8)
+        except Exception as exc:
+            log.warning("Binance Spot WebSocket connection failed: %s", exc)
+        attempt += 1
+        ws_stop.wait(min(30, 2 ** min(attempt, 5)))
+
+
+def start_price_websocket_once() -> None:
+    global ws_thread
+    if ws_thread is not None and ws_thread.is_alive():
+        return
+    ws_thread = threading.Thread(target=_websocket_price_worker, daemon=True, name="binance-spot-ws-v79")
+    ws_thread.start()
+
+
+def _price_from_kline(interval: str) -> Optional[float]:
+    """Read the live close of Binance's currently-forming Spot candle.
+
+    This deliberately mirrors the V6.7 method (reading kline[4]) that the
+    operator confirmed worked on Render. It is a live-updating candle close,
+    not the last completed candle close.
+    """
+    raw = _spot_get("/api/v3/klines", {"symbol": SYMBOL, "interval": interval, "limit": 2})
+    if not isinstance(raw, list) or not raw:
+        return None
     try:
-        with open(PAPER_FILE,"w") as f: json.dump({k:state[k] for k in ["balance","wins","losses","trades_today","day","day_start","consec_loss","cooldown_until","positions","trade_history","tier_a_count","tier_b_count"]}, f)
-    except: pass
+        value = float(raw[-1][4])
+        if math.isfinite(value) and value > 0:
+            return value
+    except (IndexError, TypeError, ValueError):
+        return None
+    return None
 
-def open_pos(a, direction, is_addon=False):
-    r = a["results"][direction]; fvg=r["fvg"]
-    entry = r["entry"]; sl, tp = r["sl"], r["tp"]
-    risk_dist = abs(entry-sl)
-    if risk_dist<=0: return False
-    risk_pct = ADDON_RISK_PERCENT if is_addon else RISK_PERCENT
-    risk_cash = state["balance"]*(risk_pct/100)
-    qty = min(risk_cash/risk_dist, MAX_NOTIONAL/entry)
-    if qty<=0: return False
-    # V9.6 ADD-ON CHECKS: New FVG + First in +1R profit
-    if is_addon:
-        first = state["positions"][0] if state["positions"] else None
-        if first and first.get("fvg") and fvg:
-            # Must be NEW FVG, not same CE
-            if abs(first["fvg"]["ce"] - fvg["ce"]) < 0.2*abs(first["fvg"]["top"]-first["fvg"]["bot"]):
-                return False
-        if first:
-            profit = (a["price"] - first["entry"]) if direction=="LONG" else (first["entry"] - a["price"])
-            first_risk = abs(first["entry"] - first["orig_sl"])
-            if first_risk==0 or profit < 1.0*first_risk:
-                return False
-    pos = {"side":direction,"entry":entry,"sl":sl,"tp":tp,"qty":qty,"notional":qty*entry,"fvg":fvg,"tier":r["tier"],"orig_sl":sl,"orig_tp":tp,"is_addon":is_addon}
-    state["positions"].append(pos)
-    state["trades_today"]+=1
-    if r["tier"]=="A_GOLDEN": state["tier_a_count"]+=1
-    else: state["tier_b_count"]+=1
-    save()
-    tag = "2ND ADD-ON (50% risk)" if is_addon else "1ST ENTRY"
-    ifvg_txt = f" IFVG {r['ifvg']['bot']:.2f}-{r['ifvg']['top']:.2f}" if r["ifvg"] else ""
-    msg=f"🟢 V9.6 {tag} {r['tier']} {direction} {state['trades_today']}/7 | Open {len(state['positions'])}/2\nEntry {entry:.2f} {'(IFVG Start)' if r['ifvg'] else '(Homma Close / CE)'}\nFVG {fvg['bot']:.2f}-{fvg['top']:.2f} CE {fvg['ce']:.2f} {ifvg_txt}\nGolden: {r['golden']} | Homma: {r['homma_name']} | Valid CHoCH: {r['valid_choch']}\nProtected: {r['protected']:.2f} | In HTF Zone: {r['in_zone']}\nSL {sl:.2f} | TP {tp:.2f} (1:2+ / Liquidity)\nScore {r['score']} | KZ {a['kz']}\nReasons: {', '.join(r['reasons'])}"
-    print(msg, flush=True); send_tg(msg); latest["last"]=msg
-    return True
 
-def monitor(price, c5):
-    for pos in list(state["positions"]):
-        side=pos["side"]
-        risk = abs(pos["entry"] - pos["orig_sl"])
-        profit = (price - pos["entry"]) if side=="LONG" else (pos["entry"] - price)
-        if risk>0 and profit > 1.0*risk:
-            if side=="LONG":
-                new_sl = min(c["l"] for c in c5[-5:]) - 0.2*atr(c5)
-                if new_sl > pos["sl"]: pos["sl"]=new_sl
-                if pos["sl"] < pos["entry"]: pos["sl"]=pos["entry"]
+def get_price() -> Optional[float]:
+    """Get fresh Binance Spot BTCUSDT price, preserving V6.7's working route.
+
+    Priority: fresh Binance trade WebSocket, Spot ticker REST, then the
+    V6.7-compatible live kline-close fallback (1m, then 15m).
+    """
+    with price_lock:
+        cached_price = price_feed["price"]
+        age = time.time() - float(price_feed["received_at"])
+        source = str(price_feed["source"])
+    if cached_price is not None and age <= PRICE_STALE_SECONDS:
+        latest["price_source"] = source
+        latest["price_age_seconds"] = round(age, 2)
+        with price_lock:
+            latest["price_latency_ms"] = price_feed.get("latency_ms")
+            latest["price_feed_status"] = (
+                "WEBSOCKET_CONNECTED" if price_feed.get("ws_connected")
+                else "REST_OR_CACHED"
+            )
+        return float(cached_price)
+
+    # First try the direct last-traded-price endpoint.
+    data = _spot_get("/api/v3/ticker/price", {"symbol": SYMBOL})
+    try:
+        value = float(data["price"]) if isinstance(data, dict) else None
+        if value is not None and math.isfinite(value) and value > 0:
+            _record_price(value, "BINANCE_SPOT_REST_TICKER")
+            return value
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    # Important: V6.7 fetched its working price from the latest kline close.
+    # Keep this exact data path as the primary fallback instead of depending
+    # solely on /ticker/price, which may be blocked while /klines still works.
+    for interval, source_name in (("1m", "BINANCE_SPOT_1M_KLINE"),
+                                  ("15m", "BINANCE_SPOT_15M_KLINE_FALLBACK")):
+        value = _price_from_kline(interval)
+        if value is not None:
+            _record_price(value, source_name)
+            return value
+
+    latest["price_source"] = "UNAVAILABLE"
+    latest["price_feed_status"] = "STALE_OR_DISCONNECTED"
+    with price_lock:
+        latest["price_age_seconds"] = (round(time.time() - float(price_feed["received_at"]), 2)
+                                        if price_feed["received_at"] else None)
+        latest["price_latency_ms"] = price_feed.get("latency_ms")
+    return None
+
+
+def get_klines(interval: str, limit: int = 250) -> Optional[List[dict]]:
+    now = time.time()
+    cached = candle_cache.get(interval)
+    if cached and now - float(cached["time"]) < CACHE_TTL[interval]:
+        return cached["data"]  # type: ignore[return-value]
+    raw = _spot_get("/api/v3/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+    if not isinstance(raw, list) or len(raw) < 30:
+        return None
+    rows = []
+    previous_open = -1
+    for k in raw:
+        try:
+            row = {"open_time": int(k[0]), "o": float(k[1]), "h": float(k[2]),
+                   "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+                   "close_time": int(k[6])}
+            if (row["open_time"] <= previous_open or
+                not all(math.isfinite(row[x]) for x in ("o", "h", "l", "c", "v")) or
+                min(row["o"], row["h"], row["l"], row["c"]) <= 0 or row["v"] < 0 or
+                row["h"] < max(row["o"], row["c"], row["l"]) or
+                row["l"] > min(row["o"], row["c"], row["h"])):
+                continue
+            rows.append(row)
+            previous_open = row["open_time"]
+        except (IndexError, TypeError, ValueError):
+            continue
+    if len(rows) < 30:
+        return None
+    candle_cache[interval] = {"time": now, "data": rows}
+    return rows
+
+def closed_candles(rows: List[dict]) -> List[dict]:
+    """Exclude the still-forming final candle using exchange close timestamp."""
+    now_ms = int(time.time() * 1000)
+    return [c for c in rows if c["close_time"] < now_ms]
+
+# ----------------------------- Indicators -----------------------------
+def ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    alpha = 2.0 / (period + 1.0)
+    result = sum(values[:period]) / period
+    for value in values[period:]:
+        result = alpha * value + (1.0 - alpha) * result
+    return result
+
+
+def atr(candles: List[dict], period: int = 14) -> Optional[float]:
+    if len(candles) < period + 1:
+        return None
+    tr = []
+    for i in range(1, len(candles)):
+        cur, prev = candles[i], candles[i - 1]
+        tr.append(max(cur["h"] - cur["l"], abs(cur["h"] - prev["c"]), abs(cur["l"] - prev["c"])))
+    return sum(tr[-period:]) / period
+
+
+def rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) < period + 1:
+        return None
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(x, 0.0) for x in changes[-period:]]
+    losses = [max(-x, 0.0) for x in changes[-period:]]
+    avg_gain, avg_loss = sum(gains) / period, sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+
+def trend_bias(candles: List[dict]) -> str:
+    closes = [c["c"] for c in candles]
+    e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+    if None in (e20, e50, e200):
+        return "NEUTRAL"
+    last = closes[-1]
+    if last > e200 and e20 > e50 > e200:
+        return "BULLISH"
+    if last < e200 and e20 < e50 < e200:
+        return "BEARISH"
+    return "NEUTRAL"
+
+# ----------------------------- Signal analysis -----------------------------
+
+def net_reward_risk_after_fees(direction: str, entry: float, stop: float,
+                               target: float, fee_rate: float) -> float:
+    """Estimated net reward/risk after entry and exit fees."""
+    if direction == "LONG":
+        reward, loss = target - entry, entry - stop
+    else:
+        reward, loss = entry - target, stop - entry
+    net_reward = reward - fee_rate * (entry + target)
+    net_loss = loss + fee_rate * (entry + stop)
+    return net_reward / net_loss if net_reward > 0 and net_loss > 0 else 0.0
+
+
+def detect_fvgs(candles: List[dict], timeframe: str) -> List[dict]:
+    """Detect three-candle FVGs; require a meaningful middle-candle displacement."""
+    found = []
+    if len(candles) < 20:
+        return found
+    atr_value = atr(candles, 14)
+    if not atr_value or atr_value <= 0:
+        return found
+    first = max(2, len(candles) - FVG_MAX_AGE_CANDLES)
+    for i in range(first, len(candles)):
+        a, b, c = candles[i - 2], candles[i - 1], candles[i]
+        displacement = abs(b["c"] - b["o"]) / atr_value
+        if displacement < FVG_MIN_DISPLACEMENT_ATR:
+            continue
+        if c["l"] > a["h"] and b["c"] > b["o"]:
+            low, high = a["h"], c["l"]
+            found.append({
+                "direction": "LONG", "timeframe": timeframe, "low": low, "high": high,
+                "ce": (low + high) / 2.0, "formed_at": c["open_time"],
+                "formed_index": i, "displacement_atr": round(displacement, 2),
+            })
+        if c["h"] < a["l"] and b["c"] < b["o"]:
+            low, high = c["h"], a["l"]
+            found.append({
+                "direction": "SHORT", "timeframe": timeframe, "low": low, "high": high,
+                "ce": (low + high) / 2.0, "formed_at": c["open_time"],
+                "formed_index": i, "displacement_atr": round(displacement, 2),
+            })
+    return found
+
+
+def fvg_is_invalidated(fvg: dict, candles: List[dict]) -> bool:
+    """An FVG is invalidated when a later candle closes beyond its far edge."""
+    later = candles[fvg["formed_index"] + 1:]
+    if fvg["direction"] == "LONG":
+        return any(c["c"] < fvg["low"] for c in later)
+    return any(c["c"] > fvg["high"] for c in later)
+
+
+def fvg_is_fully_mitigated(fvg: dict, candles: List[dict]) -> bool:
+    """Reject zones already fully traversed after formation."""
+    later = candles[fvg["formed_index"] + 1:]
+    if fvg["direction"] == "LONG":
+        return any(c["l"] <= fvg["low"] for c in later)
+    return any(c["h"] >= fvg["high"] for c in later)
+
+
+def recent_liquidity_sweep(candles: List[dict], direction: str,
+                           lookback: int = 12) -> bool:
+    """Recent sweep/reclaim used as FVG confluence, not as a standalone entry."""
+    if len(candles) < lookback + 2:
+        return False
+    for idx in range(max(lookback, len(candles) - 3), len(candles)):
+        prior = candles[idx - lookback:idx]
+        candle = candles[idx]
+        if direction == "LONG":
+            level = min(x["l"] for x in prior)
+            if candle["l"] < level and candle["c"] > level:
+                return True
+        else:
+            level = max(x["h"] for x in prior)
+            if candle["h"] > level and candle["c"] < level:
+                return True
+    return False
+
+
+def structure_break(candles: List[dict], direction: str, lookback: int = 10) -> bool:
+    """Recent completed 5m BOS used only as FVG quality confluence."""
+    if len(candles) < lookback + 2:
+        return False
+    prior, last = candles[-lookback-1:-1], candles[-1]
+    return (last["c"] > max(x["h"] for x in prior) if direction == "LONG"
+            else last["c"] < min(x["l"] for x in prior))
+
+
+def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
+    """
+    FVG 1.0 entry model:
+      - 1H and 15M FVGs establish higher-timeframe directional zones.
+      - 5M FVG CE (50% midpoint) is the sole execution reference.
+      - A completed 5M candle must trade into the 5M zone and live price
+        must remain near its CE.
+      - Displacement is required. Liquidity sweep or BOS is required as
+        confluence, not as an alternative entry strategy.
+      - No EMA, RSI, breakout, retest, CHOCH or pullback entry path.
+    """
+    raw = {tf: get_klines(tf, 250) for tf in ("5m", "15m", "1h")}
+    if any(v is None for v in raw.values()):
+        return None
+    candles = {tf: closed_candles(v) for tf, v in raw.items()}
+    if any(len(v) < 30 for v in candles.values()):
+        return None
+    c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
+    price = current_price if current_price is not None else get_price()
+    if price is None or price <= 0:
+        return None
+    atr5, atr15 = atr(c5, 14), atr(c15, 14)
+    if not atr5 or not atr15:
+        return None
+
+    # EMA is retained solely as a legacy dashboard reference, never as a filter.
+    e200 = ema([x["c"] for x in c15], 200)
+    if e200 is not None:
+        latest["ema"] = round(e200, 2)
+
+    zones = {
+        "1H": detect_fvgs(c1h, "1H"),
+        "15M": detect_fvgs(c15, "15M"),
+        "5M": detect_fvgs(c5, "5M"),
+    }
+    candidates, diagnostics = [], {"LONG": [], "SHORT": []}
+
+    for side in ("LONG", "SHORT"):
+        htf = []
+        for timeframe, series in (("1H", c1h), ("15M", c15)):
+            htf.extend([
+                z for z in zones[timeframe]
+                if z["direction"] == side
+                and not fvg_is_invalidated(z, series)
+                and not fvg_is_fully_mitigated(z, series)
+            ])
+        exec_zones = [
+            z for z in zones["5M"]
+            if z["direction"] == side
+            and not fvg_is_invalidated(z, c5)
+            and not fvg_is_fully_mitigated(z, c5)
+        ]
+
+        for zone in exec_zones:
+            aligned = [
+                h for h in htf
+                if (max(h["low"], zone["low"]) <= min(h["high"], zone["high"])
+                    or abs(h["ce"] - zone["ce"]) <= 0.75 * atr15)
+            ]
+            if not aligned:
+                continue
+            higher = min(aligned, key=lambda h: abs(h["ce"] - zone["ce"]))
+            tolerance = FVG_ENTRY_TOLERANCE_ATR * atr5
+            touched = (c5[-1]["l"] <= zone["high"] + tolerance
+                       and c5[-1]["h"] >= zone["low"] - tolerance)
+            near_ce = abs(price - zone["ce"]) <= max(tolerance, 0.20 * atr5)
+            if not (touched and near_ce):
+                continue
+
+            sweep = recent_liquidity_sweep(c5, side)
+            bos = structure_break(c5, side)
+            if not (sweep or bos):
+                continue
+
+            entry = zone["ce"]
+            if side == "LONG":
+                stop = min(zone["low"], higher["low"]) - FVG_STOP_ATR_BUFFER * atr5
+                risk = entry - stop
+                target = entry + RR_TARGET * risk
+                if price > entry + tolerance:
+                    continue
             else:
-                new_sl = max(c["h"] for c in c5[-5:]) + 0.2*atr(c5)
-                if new_sl < pos["sl"]: pos["sl"]=new_sl
-                if pos["sl"] > pos["entry"]: pos["sl"]=pos["entry"]
-        hit_tp = price>=pos["tp"] if side=="LONG" else price<=pos["tp"]
-        hit_sl = price<=pos["sl"] if side=="LONG" else price>=pos["sl"]
-        if not (hit_tp or hit_sl): continue
-        exit_p = pos["tp"] if hit_tp else pos["sl"]
-        gross = (exit_p-pos["entry"])*pos["qty"]*(1 if side=="LONG" else -1)
-        fees = (pos["notional"]+pos["qty"]*exit_p)*FEE
-        pnl = gross-fees
-        state["balance"]+=pnl
-        if pnl>0: state["wins"]+=1; state["consec_loss"]=0
-        else: state["losses"]+=1; state["consec_loss"]+=1; state["cooldown_until"]=time.time()+COOLDOWN_MINUTES*60
-        state["trade_history"].append({"side":side,"entry":pos["entry"],"exit":exit_p,"pnl":round(pnl,4),"result":"WIN" if pnl>0 else "LOSS","tier":pos.get("tier"),"addon":pos.get("is_addon")})
-        state["positions"].remove(pos); save()
-        msg=f"{'✅' if pnl>0 else '❌'} V9.6 {'TP' if hit_tp else 'SL/Trail'} {'ADD-ON' if pos.get('is_addon') else '1ST'} {side} Exit {exit_p:.2f} PnL ${pnl:.4f} Bal ${state['balance']:.2f} W:{state['wins']} L:{state['losses']} D:{state['trades_today']}/7 Open:{len(state['positions'])}/2"
-        print(msg, flush=True); send_tg(msg); latest["last"]=msg
+                stop = max(zone["high"], higher["high"]) + FVG_STOP_ATR_BUFFER * atr5
+                risk = stop - entry
+                target = entry - RR_TARGET * risk
+                if price < entry - tolerance:
+                    continue
+            if risk <= 0:
+                continue
 
-def run():
-    load()
-    print(f"START V9.6 FVG + REVERSAL + IFVG + TRAILING + 2ND POSITION - 1-7/Day", flush=True)
-    send_tg("🚀 KCOMS V9.6 Online\nProtected + Valid CHoCH + IFVG + Trailing + 2nd Position\nTier A: Golden/IFVG | Tier B: Standard\nMax 7 entries/day | Max 2 open | 2nd at half risk")
+            net_rr = net_reward_risk_after_fees(side, entry, stop, target, PAPER_FEE_RATE)
+            if net_rr < MIN_NET_RR_AFTER_FEES:
+                continue
+
+            age = len(c5) - 1 - zone["formed_index"]
+            score = min(100, 60 + min(15, int(zone["displacement_atr"] * 5))
+                        + (10 if sweep else 0) + (10 if bos else 0)
+                        + (5 if higher["timeframe"] == "1H" else 0))
+            reasons = [
+                f"{zone['timeframe']} {side} FVG retracement at 50% CE",
+                f"Aligned {higher['timeframe']} {side} FVG",
+                f"Displacement {zone['displacement_atr']:.2f} ATR",
+                "Liquidity sweep" if sweep else "BOS structure break",
+                "5M execution zone active",
+            ]
+            candidates.append({
+                "direction": side, "score": score, "entry": entry, "price": price,
+                "stop": stop, "target": target, "risk_distance": risk,
+                "net_rr_after_fees": net_rr, "zone": zone, "higher_zone": higher,
+                "sweep": sweep, "bos": bos, "age_5m": age, "reasons": reasons,
+            })
+            diagnostics[side].append({
+                "timeframe": zone["timeframe"], "low": zone["low"],
+                "high": zone["high"], "ce": zone["ce"],
+                "higher_timeframe": higher["timeframe"],
+                "sweep": sweep, "bos": bos, "score": score,
+            })
+
+    latest["fvg_zones"] = {tf: len(items) for tf, items in zones.items()}
+    latest["fvg_diagnostics"] = diagnostics
+    if not candidates:
+        return {
+            "price": price, "direction": "NONE", "score": 0,
+            "long_score": 0, "short_score": 0, "reasons": [],
+            "rejection_reasons": ["No valid aligned FVG retracement at 5M CE"],
+            "side_diagnostics": diagnostics, "entry_trigger": "FVG_5M_CE",
+            "bias_30m": "FVG_CONTEXT", "bias_1h": "NEUTRAL",
+            "bias_15m": "NEUTRAL", "regime": "FVG", "atr_1m": atr5,
+            "confirmed": False, "candle_key": c5[-1]["open_time"],
+            "chart_candles": c5[-70:],
+        }
+
+    selected = max(candidates, key=lambda x: x["score"])
+    return {
+        "price": price, "direction": selected["direction"], "score": selected["score"],
+        "long_score": max((x["score"] for x in candidates if x["direction"] == "LONG"), default=0),
+        "short_score": max((x["score"] for x in candidates if x["direction"] == "SHORT"), default=0),
+        "reasons": selected["reasons"], "rejection_reasons": [],
+        "side_diagnostics": diagnostics, "entry_trigger": "FVG_5M_CE",
+        "entry": selected["entry"], "stop": selected["stop"],
+        "target": selected["target"], "risk_distance": selected["risk_distance"],
+        "net_rr_after_fees": selected["net_rr_after_fees"],
+        "confirmed": selected["score"] >= MIN_SCORE,
+        "bias_30m": "FVG_CONTEXT", "bias_1h": selected["higher_zone"]["direction"],
+        "bias_15m": selected["higher_zone"]["direction"], "regime": "FVG",
+        "atr_1m": atr5, "fvg_zone": selected["zone"],
+        "higher_fvg_zone": selected["higher_zone"],
+        "candle_key": c5[-1]["open_time"], "chart_candles": c5[-70:],
+    }
+
+
+# ----------------------------- Paper trading -----------------------------
+def load_state() -> None:
+    try:
+        with open(PAPER_BALANCE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        state["balance"] = max(0.0, float(saved.get("balance", PAPER_START_BALANCE)))
+        state["wins"] = max(0, int(saved.get("wins", 0)))
+        state["losses"] = max(0, int(saved.get("losses", 0)))
+        state["trades_today"] = max(0, int(saved.get("trades_today", 0)))
+        state["day"] = str(saved.get("day", state["day"]))
+        state["cooldown_until"] = float(saved.get("cooldown_until", 0.0))
+        state["position"] = saved.get("position")
+        state["last_trade_key"] = saved.get("last_trade_key")
+        state["last_alert_key"] = saved.get("last_alert_key")
+        state["trade_history"] = saved.get("trade_history", [])[-100:]
+        if state["position"] is not None:
+            required = {"side", "entry", "stop", "target", "qty", "notional"}
+            if not required.issubset(state["position"]) or state["position"]["side"] not in ("LONG", "SHORT"):
+                log.warning("Discarding invalid saved paper position")
+                state["position"] = None
+        reset_daily_counter()
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        log.warning("Could not restore paper state; starting from configured balance: %s", exc)
+        state.update({"balance": PAPER_START_BALANCE, "wins": 0, "losses": 0,
+                      "trades_today": 0, "position": None, "cooldown_until": 0.0})
+
+
+def save_state() -> None:
+    tmp = PAPER_BALANCE_FILE + ".tmp"
+    payload = {key: state[key] for key in ("balance", "wins", "losses", "trades_today", "day",
+               "cooldown_until", "position", "last_trade_key", "last_alert_key", "trade_history")}
+    try:
+        os.makedirs(os.path.dirname(PAPER_BALANCE_FILE) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, PAPER_BALANCE_FILE)
+    except (OSError, TypeError, ValueError) as exc:
+        log.warning("Could not persist paper account: %s", exc)
+
+
+def reset_daily_counter() -> None:
+    today = datetime.now(EAT).date().isoformat()
+    if today != state["day"]:
+        state["day"] = today
+        state["trades_today"] = 0
+        save_state()
+
+
+def open_paper_position(signal: dict) -> None:
+    equity = float(state["balance"])
+    risk_cash = equity * (RISK_PERCENT / 100.0)
+    distance = float(signal["risk_distance"])
+    if distance <= 0 or equity <= 0:
+        return
+    entry_price = float(signal.get("entry", signal["price"]))
+    qty = risk_cash / distance
+    qty = min(qty, MAX_NOTIONAL_USDT / entry_price)
+    if qty <= 0:
+        return
+    notional = qty * entry_price
+    state["position"] = {
+        "side": signal["direction"], "entry": entry_price,
+        "stop": float(signal["stop"]), "target": float(signal["target"]),
+        "qty": qty, "notional": notional, "opened_at": time.time(),
+        "score": int(signal["score"]), "reasons": signal["reasons"],
+        "net_rr_after_fees": float(signal.get("net_rr_after_fees", 0.0)),
+    }
+    state["trades_today"] += 1
+    save_state()
+    msg = (
+        f"🟢 FVG 1.0 PAPER TRADE ENTERED — {signal['direction']} {SYMBOL}\nDate: {current_clock()['date']} EAT\n"
+        f"Entry: {float(signal.get('entry', signal['price'])):.2f}\nSL: {signal['stop']:.2f}\n"
+        f"TP: {signal['target']:.2f}\nScore: {signal['score']}/100\n"
+        f"Risk: ${risk_cash:.2f} | Notional: ${notional:.2f}\n"
+        f"Evidence: {', '.join(signal['reasons'])}"
+    )
+    log.info(msg.replace("\n", " | "))
+    send_tg(msg)
+    latest["last_signal"] = msg
+
+
+def monitor_paper_position(price: float) -> None:
+    pos = state.get("position")
+    if not pos:
+        return
+    side = pos["side"]
+    stop_hit = price <= pos["stop"] if side == "LONG" else price >= pos["stop"]
+    target_hit = price >= pos["target"] if side == "LONG" else price <= pos["target"]
+    if not (stop_hit or target_hit):
+        return
+    # If one sampled price crosses both levels (gap), assume the adverse stop fills first.
+    result = "LOSS" if stop_hit else "WIN"
+    exit_price = float(pos["stop"] if stop_hit else pos["target"])
+    direction = 1 if side == "LONG" else -1
+    gross = (exit_price - pos["entry"]) * float(pos["qty"]) * direction
+    # Estimated taker fee on both entry and exit notionals; actual rates vary by account/tier.
+    exit_notional = float(pos["qty"]) * exit_price
+    fees = (float(pos["notional"]) + exit_notional) * PAPER_FEE_RATE
+    pnl = gross - fees
+    result = "WIN" if pnl > 0 else "LOSS"
+    state["balance"] += pnl
+    if result == "WIN":
+        state["wins"] += 1
+    else:
+        state["losses"] += 1
+        state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
+    state.setdefault("trade_history", []).append({
+        "closed_at": current_clock()["timestamp"],
+        "side": side,
+        "entry": float(pos["entry"]),
+        "exit": exit_price,
+        "stop": float(pos["stop"]),
+        "target": float(pos["target"]),
+        "gross_pnl": round(gross, 6),
+        "fees": round(fees, 6),
+        "net_pnl": round(pnl, 6),
+        "result": result,
+        "score": int(pos.get("score", 0)),
+        "net_rr_at_entry": float(pos.get("net_rr_after_fees", 0.0)),
+        "duration_seconds": round(max(0.0, time.time() - float(pos.get("opened_at", time.time()))), 1),
+    })
+    state["trade_history"] = state["trade_history"][-100:]
+    msg = (
+        f"{'✅' if pnl > 0 else '❌'} FVG 1.0 PAPER {result} — {side} {SYMBOL}\n"
+        f"Exit reason: {'TAKE PROFIT' if target_hit else 'STOP LOSS'}\nDate: {current_clock()['date']} EAT\n"
+        f"Entry: {float(pos['entry']):.2f} | Exit: {exit_price:.2f}\nNet P/L: ${pnl:.4f} (estimated fees included)\n"
+        f"Paper balance: ${state['balance']:.2f}\n"
+        f"W:{state['wins']} L:{state['losses']}"
+    )
+    log.info(msg.replace("\n", " | "))
+    send_tg(msg)
+    latest["last_signal"] = msg
+    state["position"] = None
+    save_state()
+    latest.update({"wins": state["wins"], "losses": state["losses"],
+                   "completed_trades": state["wins"] + state["losses"],
+                   "balance": round(state["balance"], 2)})
+
+# ----------------------------- Console monitoring -----------------------------
+def log_live_status(price: Optional[float], force: bool = False, refresh_ema: bool = True) -> None:
+    """Print the compact V6.7-style status line requested for Render logs."""
+    now = time.time()
+    if not force and now - float(state.get("last_status_log", 0.0)) < LOG_INTERVAL_SECONDS:
+        return
+    state["last_status_log"] = now
+    latest.update(current_clock())
+
+    # Use the 200-period EMA from completed Binance Spot 15m candles.
+    ema_value = float(latest.get("ema") or 0.0)
+    if ema_value <= 0 and refresh_ema:
+        candles = get_klines("15m", 250)
+        if candles:
+            closed = closed_candles(candles)
+            calculated = ema([c["c"] for c in closed], 200)
+            if calculated is not None:
+                ema_value = calculated
+                latest["ema"] = round(calculated, 2)
+
+    if price is not None and math.isfinite(float(price)) and float(price) > 0:
+        price_text = f"{float(price):.2f}"
+    else:
+        price_text = "UNAVAILABLE"
+
+    position = state.get("position")
+    cooldown_remaining = max(0, int(float(state.get("cooldown_until", 0.0)) - now))
+    if position:
+        status = f"IN_TRADE_{position['side']}"
+        trade_detail = (f"ENTRY {float(position['entry']):.2f} | "
+                        f"SL {float(position['stop']):.2f} | TP {float(position['target']):.2f}")
+    elif cooldown_remaining > 0:
+        status = "COOLING"
+        trade_detail = f"COOLDOWN {cooldown_remaining}s remaining"
+    else:
+        status = latest.get("status", "SCANNING")
+        if status in ("IN_POSITION", "SCANNING", "BOOTING") and price is not None:
+            status = "SCANNING"
+        trade_detail = ""
+    balance = float(state.get("balance", PAPER_START_BALANCE))
+    wins = int(state.get("wins", 0))
+    losses = int(state.get("losses", 0))
+    trades = int(state.get("trades_today", 0))
+    print(
+        f"[{latest['date']} {latest['time']} EAT] Price {price_text} | "
+        f"EMA {ema_value:.2f} | {status} | Bal ${balance:.2f} | "
+        f"W:{wins} L:{losses} D:{trades}/{MAX_TRADES_PER_DAY}"
+        f"{' | ' + trade_detail if trade_detail else ''}",
+        flush=True,
+    )
+
+
+# ----------------------------- Price display heartbeat -----------------------------
+_price_heartbeat_thread = None
+_price_heartbeat_start_lock = threading.Lock()
+_price_heartbeat_stop = threading.Event()
+
+
+def _price_display_heartbeat() -> None:
+    """Refresh the Render price display every 0.5s from cached WebSocket data.
+
+    This thread never calls Binance REST and does not run market analysis or
+    alter trade decisions. It only prints the most recently received price.
+    """
+    while not _price_heartbeat_stop.wait(0.5):
+        try:
+            with price_lock:
+                price = price_feed.get("price")
+            if price is None:
+                price = latest.get("price")
+            log_live_status(price, refresh_ema=False)
+        except Exception:
+            log.exception("Price display heartbeat error")
+
+
+def start_price_display_heartbeat_once() -> None:
+    global _price_heartbeat_thread
+    with _price_heartbeat_start_lock:
+        if _price_heartbeat_thread is not None and _price_heartbeat_thread.is_alive():
+            return
+        _price_heartbeat_stop.clear()
+        _price_heartbeat_thread = threading.Thread(
+            target=_price_display_heartbeat,
+            daemon=True,
+            name="fvg1-price-display-500ms",
+        )
+        _price_heartbeat_thread.start()
+        log.info("Price display heartbeat started: 0.5s (cached WebSocket price; no extra REST polling)")
+
+
+# ----------------------------- Main loop -----------------------------
+def run_bot() -> None:
+    load_state()
+    start_telegram_worker_once()
+    if not TG_TOKEN or not TG_CHAT:
+        log.warning("Telegram alerts disabled: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID missing")
+    start_price_websocket_once()
+    start_price_display_heartbeat_once()
+    latest.update({"status": "SCANNING", "balance": round(state["balance"], 2)})
+    log.info("FVG 1.0 AUTO PAPER MODE started: %s; LONG+SHORT; minimum score %s; risk %.3f%%; gross RR 1:%.2f; max notional $%.2f; fee/side %.3f%%; minimum net RR %.2f; daily trade limit %s; cooldown %sm; FVG max age %s candles; Telegram trade-event alerts only",
+             SYMBOL, MIN_SCORE, RISK_PERCENT, RR_TARGET, MAX_NOTIONAL_USDT,
+             PAPER_FEE_RATE * 100, MIN_NET_RR_AFTER_FEES,
+             MAX_TRADES_PER_DAY, COOLDOWN_MINUTES, FVG_MAX_AGE_CANDLES)
+    log_live_status(None, force=True)
+
     while True:
         try:
-            today = now_eat().date().isoformat()
-            if today!=state["day"]:
-                state["day"]=today; state["trades_today"]=0; state["day_start"]=state["balance"]; state["consec_loss"]=0; state["tier_a_count"]=0; state["tier_b_count"]=0; save()
-            if time.time()<state["cooldown_until"]:
-                time.sleep(2); continue
-            if state["day_start"]-state["balance"] >= MAX_DAILY_LOSS:
-                latest["status"]="DAILY_LOSS_LIMIT"; time.sleep(5); continue
-            if state["consec_loss"]>=MAX_CONSEC_LOSS:
-                latest["status"]="LOSS_STREAK_STOP"; time.sleep(5); continue
-            if state["trades_today"]>=MAX_TRADES_PER_DAY:
-                latest["status"]="DAILY_LIMIT_7_REACHED"; time.sleep(10); continue
-            a = analyse()
-            if not a:
-                time.sleep(SCAN_INTERVAL); continue
-            price=a["price"]
-            d5 = get_klines("5m", 250)
-            c5 = closed(d5) if d5 else []
-            monitor(price, c5)
-            best=a["best"]; res=a["results"][best]
-            latest.update({"price":round(price,2),"bias":a["bias"],"fvg":res["fvg"],"ce":res["fvg"]["ce"] if res["fvg"] else None,
-                           "tier":res["tier"],"killzone":a["kz"],"golden":res["golden"],"homma":res["homma_name"],
-                           "protected":res["protected"],"choch_valid":res["valid_choch"],"ifvg":res["ifvg"],"in_zone":res["in_zone"],"open_pos":len(state["positions"]),
-                           "balance":round(state["balance"],2),"wins":state["wins"],"losses":state["losses"],"trades_today":state["trades_today"],
-                           "status":"IN_POSITION" if state["positions"] else "SCANNING","rejection":", ".join(res["reasons"])})
-            print(f"[{now_eat().strftime('%H:%M:%S')} EAT] Price {price:.2f} | Bias {a['bias']} | KZ {a['kz']} | Best {best} Score {res['score']} Tier {res['tier']} Golden {res['golden']} IFVG {res['ifvg']} ValidCHoCH {res['valid_choch']} InZone {res['in_zone']} | Bal ${state['balance']:.2f} D:{state['trades_today']}/7 Open:{len(state['positions'])}/2 A:{state['tier_a_count']} B:{state['tier_b_count']}", flush=True)
-            if res["confirmed"]:
-                if len(state["positions"]) == 0:
-                    open_pos(a, best, is_addon=False)
-                elif len(state["positions"]) == 1:
-                    open_side = state["positions"][0]["side"]
-                    if open_side == best:
-                        open_pos(a, best, is_addon=True)
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            print(f"LOOP ERR {e}", flush=True); time.sleep(2)
+            with lock:
+                reset_daily_counter()
+                price = get_price()
+                if price is None:
+                    latest["status"] = "WAITING_FOR_PRICE"
+                    latest["last_error"] = latest.get("last_error") or "Binance Spot price unavailable"
+                    log.warning("BINANCE SPOT PRICE UNAVAILABLE | REST and WebSocket feed unavailable | %s", latest["last_error"])
+                    log_live_status(None)
+                    time.sleep(SCAN_INTERVAL)
+                    continue
+                monitor_paper_position(price)
+                analysis = analyse_market(price)
+                if analysis is None:
+                    latest.update({
+                        "status": "IN_TRADE" if state["position"] else "WAITING_FOR_DATA",
+                        "price": round(price, 2), "wins": state["wins"],
+                        "losses": state["losses"],
+                        "completed_trades": state["wins"] + state["losses"],
+                        "trades_today": state["trades_today"],
+                        "balance": round(state["balance"], 2),
+                    })
+                    log_live_status(price)
+                    time.sleep(SCAN_INTERVAL)
+                    continue
 
+                # Record one diagnostic sample per completed 1m candle (not every scan).
+                if state.get("last_diagnostic_key") != analysis["candle_key"]:
+                    state["last_diagnostic_key"] = analysis["candle_key"]
+                    if not analysis["confirmed"]:
+                        for reason in analysis["rejection_reasons"]:
+                            counts = state.setdefault("rejection_counts", {})
+                            counts[reason] = int(counts.get(reason, 0)) + 1
+                    recent = state.setdefault("recent_rejections", [])
+                    recent.append({
+                        "time": current_clock()["timestamp"],
+                        "direction": analysis["direction"],
+                        "score": analysis["score"],
+                        "confirmed": analysis["confirmed"],
+                        "reasons": analysis["rejection_reasons"],
+                        "side_diagnostics": analysis.get("side_diagnostics", {}),
+                    })
+                    state["recent_rejections"] = recent[-20:]
+
+                latest.update({
+                    "status": "IN_POSITION" if state["position"] else "SCANNING",
+                    "price": round(price, 2), "bias": analysis["bias_30m"],
+                    "signal": analysis["direction"], "score": analysis["score"],
+                    "market_regime": analysis["regime"],
+                    "entry_status": "CONFIRMED" if analysis["confirmed"] else "REJECTED",
+                    "rejection_reasons": analysis["rejection_reasons"],
+                    "side_diagnostics": analysis.get("side_diagnostics", {}),
+                    "long_score": analysis["long_score"], "short_score": analysis["short_score"],
+                    "entry_trigger": analysis["entry_trigger"],
+                    "rejection_counts": dict(state.get("rejection_counts", {})),
+                    "recent_rejections": list(state.get("recent_rejections", [])),
+                    "wins": state["wins"], "losses": state["losses"],
+                    "completed_trades": state["wins"] + state["losses"],
+                    "trades_today": state["trades_today"],
+                    "balance": round(state["balance"], 2), "last_error": "",
+                })
+
+                # Automatically open paper trades when the existing strategy confirms.
+                can_enter = (
+                    analysis["confirmed"] and state["position"] is None
+                    and state["trades_today"] < MAX_TRADES_PER_DAY
+                    and time.time() >= float(state["cooldown_until"])
+                    and state["last_trade_key"] != analysis["candle_key"]
+                )
+                if can_enter:
+                    state["last_trade_key"] = analysis["candle_key"]
+                    open_paper_position(analysis)
+                latest["status"] = "IN_POSITION" if state["position"] else "SCANNING"
+                latest["wins"] = state["wins"]
+                latest["losses"] = state["losses"]
+                latest["trades_today"] = state["trades_today"]
+                latest["balance"] = round(state["balance"], 2)
+                log_live_status(price)
+            time.sleep(SCAN_INTERVAL)
+        except Exception as exc:
+            log.exception("Main loop error")
+            latest["last_error"] = str(exc)
+            latest["status"] = "ERROR_RECOVERING"
+            time.sleep(max(2, SCAN_INTERVAL))
+
+# ----------------------------- Status endpoints -----------------------------
 @app.route("/")
 def home():
-    return f"<h1>KCOMS V9.6 ✅</h1><p>Price {latest['price']} | Bias {latest['bias']} | {latest['status']} | KZ {latest['killzone']} | Open {latest['open_pos']}/2</p><p>FVG {latest['fvg']} | CE {latest['ce']} | Tier {latest['tier']} | Golden {latest['golden']} | Homma {latest['homma']}</p><p>Protected {latest['protected']} | Valid CHoCH {latest['choch_valid']} | IFVG {latest['ifvg']} | In HTF Zone {latest['in_zone']}</p><p>Bal ${latest['balance']} W:{latest['wins']} L:{latest['losses']} D:{latest['trades_today']}/7 A:{state['tier_a_count']} B:{state['tier_b_count']}</p><p>{latest['last']}</p><p>Reasons: {latest['rejection']}</p>"
+    with lock:
+        latest.update(current_clock())
+        data = dict(latest)
+    return (
+        "<h1>FVG 1.0</h1>"
+        f"<p>Date: {data['date']} | Time: {data['time']} {data['timezone']}</p>"
+        f"<p>{data['symbol']} | BINANCE SPOT DATA | PAPER ONLY | Minimum score {MIN_SCORE}/100</p>"
+        f"<p>Status: {data['status']} | Price: {data['price']} | Source: {data.get('price_source', 'UNKNOWN')} | Bias: {data['bias']}</p>"
+        f"<p>Feed: {data.get('price_feed_status', 'UNKNOWN')} | Price age: {data.get('price_age_seconds')}s | Exchange latency: {data.get('price_latency_ms')}ms</p>"
+        f"<p>Signal: {data['signal']} ({data['score']}/100) | Regime: {data['market_regime']} | Entry: {data.get('entry_status', 'WAITING')} | Trigger: {data.get('entry_trigger', 'NONE')}</p>"
+        f"<p>LONG score: {data.get('long_score', 0)} | SHORT score: {data.get('short_score', 0)}</p>"
+        f"<p>Rejection reasons: {', '.join(data.get('rejection_reasons', [])) or 'None'}</p>"
+        f"<p>Side diagnostics: {data.get('side_diagnostics', {})}</p>"
+        f"<p>Rejection counts: {data.get('rejection_counts', {})}</p>"
+        f"<p>Paper balance: ${data['balance']} | Completed: {data.get('completed_trades', data['wins'] + data['losses'])} "
+        f"| Wins: {data['wins']} | Losses: {data['losses']} "
+        f"| Today: {data['trades_today']}/{MAX_TRADES_PER_DAY}</p>"
+        "<p>Execution: AUTOMATIC PAPER</p>"
+        f"<p>Trade details: {('SIDE ' + str(state['position']['side']) + ' | ENTRY ' + format(float(state['position']['entry']), '.2f') + ' | SL ' + format(float(state['position']['stop']), '.2f') + ' | TP ' + format(float(state['position']['target']), '.2f')) if state['position'] else ('COOLING: ' + str(max(0, int(float(state['cooldown_until']) - time.time()))) + ' seconds remaining' if float(state['cooldown_until']) > time.time() else 'No open trade / not cooling')}</p>"
+        f"<p>Last: {data['last_signal']}</p>"
+    )
+
 
 @app.route("/health")
-def health(): return "ok",200
-@app.route("/status")
-def status(): return jsonify({**latest, "positions":state["positions"], "paper_only":True, "tier_a":state["tier_a_count"], "tier_b":state["tier_b_count"]})
+def health():
+    latest.update(current_clock())
+    engine_alive = bool(_engine_thread and _engine_thread.is_alive())
+    return jsonify({
+        "ok": True, "bot": "FVG 1.0", "status": latest["status"],
+        "engine_thread_alive": engine_alive, **current_clock()
+    }), 200
 
-threading.Thread(target=run, daemon=True).start()
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)), threaded=True)
+
+@app.route("/status")
+def status():
+    with lock:
+        latest.update(current_clock())
+        completed = state["wins"] + state["losses"]
+        return jsonify({**latest, "completed_trades": completed,
+                        "win_rate_percent": round(100.0 * state["wins"] / completed, 2) if completed else 0.0,
+                        "open_position": state["position"] is not None,
+                        "position": state["position"],
+                        "trades_today_limit": MAX_TRADES_PER_DAY,
+                        "cooldown_active": time.time() < float(state["cooldown_until"]),
+                        "cooldown_remaining_seconds": max(0, int(float(state["cooldown_until"]) - time.time())),
+                        "trade_levels": ({"side": state["position"]["side"],
+                                         "entry": state["position"]["entry"],
+                                         "stop_loss": state["position"]["stop"],
+                                         "take_profit": state["position"]["target"]}
+                                        if state["position"] else None),
+                        "paper_only": True, "minimum_score": MIN_SCORE, "strategy": "FVG_ONLY", "fvg_zones": latest.get("fvg_zones", {}), "fvg_diagnostics": latest.get("fvg_diagnostics", {}),
+                        "max_notional_usdt": MAX_NOTIONAL_USDT,
+                        "paper_fee_rate_per_side": PAPER_FEE_RATE,
+                        "minimum_net_rr_after_fees": MIN_NET_RR_AFTER_FEES,
+                        "recent_trade_history": list(state.get("trade_history", [])[-20:]),
+                        "rejection_counts": dict(state.get("rejection_counts", {})),
+                        "recent_rejections": list(state.get("recent_rejections", [])),
+                        "side_diagnostics": latest.get("side_diagnostics", {})})
+
+
+# ----------------------- Single-service Render Free mode -----------------------
+# One Render Web Service hosts BOTH Flask and the trading engine.
+# Use exactly ONE Gunicorn worker: multiple workers would duplicate the bot.
+# FVG_ROLE=web is accepted for compatibility with the previous V8.1 service.
+KCOMS_ROLE = os.getenv("FVG_ROLE", os.getenv("KCOMS_ROLE", "combined")).strip().lower()
+_engine_start_lock = threading.Lock()
+_engine_thread = None
+
+def start_embedded_engine_once() -> None:
+    """Start one scanner thread inside the single Gunicorn web worker."""
+    global _engine_thread
+    with _engine_start_lock:
+        if _engine_thread is not None and _engine_thread.is_alive():
+            return
+        _engine_thread = threading.Thread(
+            target=run_bot, daemon=True, name="fvg1-trading-engine"
+        )
+        _engine_thread.start()
+        log.info("FVG 1.0 embedded trading engine thread started")
+
+if KCOMS_ROLE in ("combined", "web"):
+    # Gunicorn imports this module in its sole worker process. The engine and
+    # Flask therefore share the same process and in-memory status.
+    start_embedded_engine_once()
+elif KCOMS_ROLE == "worker":
+    # Retained only for manual/local use; do not create a Render Background Worker
+    # for the free single-service deployment.
+    if __name__ == "__main__":
+        log.info("Starting FVG 1.0 standalone trading worker")
+        run_bot()
+else:
+    raise RuntimeError("KCOMS_ROLE must be 'combined', 'web', or 'worker'")
+
+if __name__ == "__main__" and KCOMS_ROLE in ("combined", "web"):
+    # Local fallback. Render should use the Gunicorn Start Command in README.txt.
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
