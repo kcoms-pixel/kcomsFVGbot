@@ -134,7 +134,7 @@ latest = {
     "wins": 0, "losses": 0, "completed_trades": 0, "trades_today": 0,
     "balance": PAPER_START_BALANCE, "last_signal": "Starting",
     "market_regime": "UNKNOWN", "entry_status": "WAITING", "rejection_reasons": [],
-    "side_diagnostics": {}, "long_score": 0, "short_score": 0,
+    "side_diagnostics": {}, "fvg_stage_diagnostics": {}, "long_score": 0, "short_score": 0,
     "entry_trigger": "NONE", "fvg_zones": {}, "fvg_diagnostics": {}, "last_error": "",
 }
 state = {
@@ -550,15 +550,11 @@ def structure_break(candles: List[dict], direction: str, lookback: int = 10) -> 
 
 
 def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
-    """
-    FVG 1.0 entry model:
-      - 1H and 15M FVGs establish higher-timeframe directional zones.
-      - 5M FVG CE (50% midpoint) is the sole execution reference.
-      - A completed 5M candle must trade into the 5M zone and live price
-        must remain near its CE.
-      - Displacement is required. Liquidity sweep or BOS is required as
-        confluence, not as an alternative entry strategy.
-      - No EMA, RSI, breakout, retest, CHOCH or pullback entry path.
+    """FVG-only analysis with stage-by-stage diagnostics.
+
+    IMPORTANT: diagnostics are observational only. The existing entry gates,
+    thresholds, scoring, stop/target calculations and paper execution rules
+    below are intentionally unchanged.
     """
     raw = {tf: get_klines(tf, 250) for tf in ("5m", "15m", "1h")}
     if any(v is None for v in raw.values()):
@@ -584,43 +580,134 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         "15M": detect_fvgs(c15, "15M"),
         "5M": detect_fvgs(c5, "5M"),
     }
-    candidates, diagnostics = [], {"LONG": [], "SHORT": []}
+    candidates = []
+    diagnostics = {"LONG": [], "SHORT": []}
+    stage_diagnostics = {}
+
+    def bump(counts: dict, key: str) -> None:
+        counts[key] = int(counts.get(key, 0)) + 1
 
     for side in ("LONG", "SHORT"):
+        counts = {
+            "raw_5m_fvgs": 0, "valid_5m_fvgs": 0,
+            "raw_1h_fvgs": 0, "valid_1h_fvgs": 0,
+            "invalidated_1h_fvgs": 0, "mitigated_1h_fvgs": 0,
+            "raw_15m_fvgs": 0, "valid_15m_fvgs": 0,
+            "invalidated_15m_fvgs": 0, "mitigated_15m_fvgs": 0,
+            "aligned_5m_fvgs": 0, "candle_touched": 0,
+            "near_ce": 0, "sweep_or_bos": 0,
+            "risk_valid": 0, "net_rr_pass": 0, "final_candidates": 0,
+        }
+        rejected = {}
+        zone_details = []
+        htf_zone_details = []
         htf = []
-        for timeframe, series in (("1H", c1h), ("15M", c15)):
-            htf.extend([
-                z for z in zones[timeframe]
-                if z["direction"] == side
-                and not fvg_is_invalidated(z, series)
-                and not fvg_is_fully_mitigated(z, series)
-            ])
-        exec_zones = [
-            z for z in zones["5M"]
-            if z["direction"] == side
-            and not fvg_is_invalidated(z, c5)
-            and not fvg_is_fully_mitigated(z, c5)
-        ]
 
-        for zone in exec_zones:
+        for timeframe, series in (("1H", c1h), ("15M", c15)):
+            directional = [z for z in zones[timeframe] if z["direction"] == side]
+            counts[f"raw_{timeframe.lower()}_fvgs"] = len(directional)
+            for z in directional:
+                invalidated = fvg_is_invalidated(z, series)
+                mitigated = fvg_is_fully_mitigated(z, series)
+                htf_zone_details.append({
+                    "timeframe": timeframe, "direction": side,
+                    "low": round(z["low"], 2), "high": round(z["high"], 2),
+                    "ce": round(z["ce"], 2),
+                    "displacement_atr": z["displacement_atr"],
+                    "formed_at": z["formed_at"],
+                    "invalidated": invalidated,
+                    "fully_mitigated": mitigated,
+                    "valid": not invalidated and not mitigated,
+                })
+                if invalidated:
+                    bump(counts, f"invalidated_{timeframe.lower()}_fvgs")
+                if mitigated:
+                    bump(counts, f"mitigated_{timeframe.lower()}_fvgs")
+                if not invalidated and not mitigated:
+                    htf.append(z)
+                    bump(counts, f"valid_{timeframe.lower()}_fvgs")
+
+        raw_exec_zones = [z for z in zones["5M"] if z["direction"] == side]
+        counts["raw_5m_fvgs"] = len(raw_exec_zones)
+        for zone in raw_exec_zones:
+            detail = {
+                "timeframe": "5M", "direction": side,
+                "low": round(zone["low"], 2), "high": round(zone["high"], 2),
+                "ce": round(zone["ce"], 2),
+                "displacement_atr": zone["displacement_atr"],
+                "formed_at": zone["formed_at"],
+                "age_5m": len(c5) - 1 - zone["formed_index"],
+            }
+            invalidated = fvg_is_invalidated(zone, c5)
+            mitigated = fvg_is_fully_mitigated(zone, c5)
+            detail["invalidated"] = invalidated
+            detail["fully_mitigated"] = mitigated
+            if invalidated or mitigated:
+                why = "FVG invalidated" if invalidated else "FVG fully mitigated"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
+                continue
+
+            bump(counts, "valid_5m_fvgs")
             aligned = [
                 h for h in htf
                 if (max(h["low"], zone["low"]) <= min(h["high"], zone["high"])
                     or abs(h["ce"] - zone["ce"]) <= 0.75 * atr15)
             ]
+            detail["aligned_htf_count"] = len(aligned)
             if not aligned:
+                why = "No aligned valid 1H/15M FVG"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
                 continue
+
+            bump(counts, "aligned_5m_fvgs")
             higher = min(aligned, key=lambda h: abs(h["ce"] - zone["ce"]))
+            detail["higher_timeframe"] = higher["timeframe"]
             tolerance = FVG_ENTRY_TOLERANCE_ATR * atr5
             touched = (c5[-1]["l"] <= zone["high"] + tolerance
                        and c5[-1]["h"] >= zone["low"] - tolerance)
-            near_ce = abs(price - zone["ce"]) <= max(tolerance, 0.20 * atr5)
-            if not (touched and near_ce):
+            near_ce_distance = abs(price - zone["ce"])
+            near_ce_limit = max(tolerance, 0.20 * atr5)
+            near_ce = near_ce_distance <= near_ce_limit
+            detail.update({
+                "candle_touched": touched,
+                "near_ce": near_ce,
+                "live_price": round(price, 2),
+                "ce_distance": round(near_ce_distance, 2),
+                "ce_distance_atr": round(near_ce_distance / atr5, 3),
+                "ce_tolerance": round(near_ce_limit, 2),
+            })
+            if touched:
+                bump(counts, "candle_touched")
+            if near_ce:
+                bump(counts, "near_ce")
+            if not touched:
+                why = "Latest completed 5M candle did not touch FVG zone"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
+                continue
+            if not near_ce:
+                why = "Live price is outside 5M FVG CE tolerance"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
                 continue
 
             sweep = recent_liquidity_sweep(c5, side)
             bos = structure_break(c5, side)
-            if not (sweep or bos):
+            detail["liquidity_sweep"] = sweep
+            detail["bos"] = bos
+            if sweep or bos:
+                bump(counts, "sweep_or_bos")
+            else:
+                why = "No 5M liquidity sweep or BOS confluence"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
                 continue
 
             entry = zone["ce"]
@@ -629,19 +716,38 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
                 risk = entry - stop
                 target = entry + RR_TARGET * risk
                 if price > entry + tolerance:
+                    why = "LONG price moved above permitted CE entry tolerance"
+                    detail["rejection"] = why
+                    bump(rejected, why)
+                    zone_details.append(detail)
                     continue
             else:
                 stop = max(zone["high"], higher["high"]) + FVG_STOP_ATR_BUFFER * atr5
                 risk = stop - entry
                 target = entry - RR_TARGET * risk
                 if price < entry - tolerance:
+                    why = "SHORT price moved below permitted CE entry tolerance"
+                    detail["rejection"] = why
+                    bump(rejected, why)
+                    zone_details.append(detail)
                     continue
             if risk <= 0:
+                why = "Calculated stop risk is not positive"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
                 continue
+            bump(counts, "risk_valid")
 
             net_rr = net_reward_risk_after_fees(side, entry, stop, target, PAPER_FEE_RATE)
+            detail["net_rr_after_fees"] = round(net_rr, 4)
             if net_rr < MIN_NET_RR_AFTER_FEES:
+                why = "Net reward/risk after fees below minimum"
+                detail["rejection"] = why
+                bump(rejected, why)
+                zone_details.append(detail)
                 continue
+            bump(counts, "net_rr_pass")
 
             age = len(c5) - 1 - zone["formed_index"]
             score = min(100, 60 + min(15, int(zone["displacement_atr"] * 5))
@@ -660,21 +766,45 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
                 "net_rr_after_fees": net_rr, "zone": zone, "higher_zone": higher,
                 "sweep": sweep, "bos": bos, "age_5m": age, "reasons": reasons,
             })
+            bump(counts, "final_candidates")
+            detail.update({"rejection": None, "score": score,
+                           "entry": round(entry, 2), "stop": round(stop, 2),
+                           "target": round(target, 2)})
             diagnostics[side].append({
                 "timeframe": zone["timeframe"], "low": zone["low"],
                 "high": zone["high"], "ce": zone["ce"],
                 "higher_timeframe": higher["timeframe"],
                 "sweep": sweep, "bos": bos, "score": score,
             })
+            zone_details.append(detail)
+
+        stage_diagnostics[side] = {
+            "counts": counts,
+            "rejection_counts": rejected,
+            "higher_timeframe_zones": htf_zone_details[-40:],
+            "execution_zones": zone_details[-30:],
+        }
 
     latest["fvg_zones"] = {tf: len(items) for tf, items in zones.items()}
     latest["fvg_diagnostics"] = diagnostics
+    latest["fvg_stage_diagnostics"] = stage_diagnostics
+
+    all_rejections = {}
+    for side_data in stage_diagnostics.values():
+        for reason, count in side_data["rejection_counts"].items():
+            all_rejections[reason] = all_rejections.get(reason, 0) + count
     if not candidates:
+        if all_rejections:
+            top_reasons = sorted(all_rejections.items(), key=lambda item: item[1], reverse=True)[:5]
+            rejection_reasons = [f"{reason} ({count} zone(s))" for reason, count in top_reasons]
+        else:
+            rejection_reasons = ["No directional 5M FVGs detected with required displacement"]
         return {
             "price": price, "direction": "NONE", "score": 0,
             "long_score": 0, "short_score": 0, "reasons": [],
-            "rejection_reasons": ["No valid aligned FVG retracement at 5M CE"],
-            "side_diagnostics": diagnostics, "entry_trigger": "FVG_5M_CE",
+            "rejection_reasons": rejection_reasons,
+            "side_diagnostics": diagnostics, "fvg_stage_diagnostics": stage_diagnostics,
+            "entry_trigger": "FVG_5M_CE",
             "bias_30m": "FVG_CONTEXT", "bias_1h": "NEUTRAL",
             "bias_15m": "NEUTRAL", "regime": "FVG", "atr_1m": atr5,
             "confirmed": False, "candle_key": c5[-1]["open_time"],
@@ -687,7 +817,8 @@ def analyse_market(current_price: Optional[float] = None) -> Optional[dict]:
         "long_score": max((x["score"] for x in candidates if x["direction"] == "LONG"), default=0),
         "short_score": max((x["score"] for x in candidates if x["direction"] == "SHORT"), default=0),
         "reasons": selected["reasons"], "rejection_reasons": [],
-        "side_diagnostics": diagnostics, "entry_trigger": "FVG_5M_CE",
+        "side_diagnostics": diagnostics, "fvg_stage_diagnostics": stage_diagnostics,
+        "entry_trigger": "FVG_5M_CE",
         "entry": selected["entry"], "stop": selected["stop"],
         "target": selected["target"], "risk_distance": selected["risk_distance"],
         "net_rr_after_fees": selected["net_rr_after_fees"],
@@ -974,7 +1105,7 @@ def run_bot() -> None:
                     time.sleep(SCAN_INTERVAL)
                     continue
 
-                # Record one diagnostic sample per completed 1m candle (not every scan).
+                # Record one diagnostic sample per completed 5m candle (not every scan).
                 if state.get("last_diagnostic_key") != analysis["candle_key"]:
                     state["last_diagnostic_key"] = analysis["candle_key"]
                     if not analysis["confirmed"]:
@@ -989,6 +1120,7 @@ def run_bot() -> None:
                         "confirmed": analysis["confirmed"],
                         "reasons": analysis["rejection_reasons"],
                         "side_diagnostics": analysis.get("side_diagnostics", {}),
+                    "fvg_stage_diagnostics": analysis.get("fvg_stage_diagnostics", {}),
                     })
                     state["recent_rejections"] = recent[-20:]
 
@@ -1000,6 +1132,7 @@ def run_bot() -> None:
                     "entry_status": "CONFIRMED" if analysis["confirmed"] else "REJECTED",
                     "rejection_reasons": analysis["rejection_reasons"],
                     "side_diagnostics": analysis.get("side_diagnostics", {}),
+                    "fvg_stage_diagnostics": analysis.get("fvg_stage_diagnostics", {}),
                     "long_score": analysis["long_score"], "short_score": analysis["short_score"],
                     "entry_trigger": analysis["entry_trigger"],
                     "rejection_counts": dict(state.get("rejection_counts", {})),
@@ -1087,6 +1220,8 @@ def status():
                                          "take_profit": state["position"]["target"]}
                                         if state["position"] else None),
                         "paper_only": True, "minimum_score": MIN_SCORE, "strategy": "FVG_ONLY", "fvg_zones": latest.get("fvg_zones", {}), "fvg_diagnostics": latest.get("fvg_diagnostics", {}),
+                        "fvg_stage_diagnostics": latest.get("fvg_stage_diagnostics", {}),
+                        "diagnostic_candle_interval": "5m",
                         "max_notional_usdt": MAX_NOTIONAL_USDT,
                         "paper_fee_rate_per_side": PAPER_FEE_RATE,
                         "minimum_net_rr_after_fees": MIN_NET_RR_AFTER_FEES,
